@@ -1,0 +1,13 @@
+# Dependencies for running embed_fhibe.py on the GPU instance.
+#
+# Install torch from the CUDA index that matches your GPU driver. Example for CUDA 12.1:
+#   pip install -r requirements-embed.txt --extra-index-url https://download.pytorch.org/whl/cu121
+#
+# For CUDA 11.8:  --extra-index-url https://download.pytorch.org/whl/cu118
+# For CPU-only smoke test: just `pip install -r requirements-embed.txt` (gets CPU torch).
+
+torch>=2.1
+open_clip_torch>=2.24
+pillow>=10.0
+numpy>=1.24,<2.0
+tqdm>=4.65

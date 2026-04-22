@@ -1,0 +1,16 @@
+# Dependencies for running serve_fhibe.py on the small CPU instance.
+#
+# Force CPU-only torch to save ~1.5GB of disk and avoid CUDA libs we don't need:
+#   pip install -r requirements-serve.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# Plain `pip install -r requirements-serve.txt` also works but may pull CUDA wheels.
+ 
+torch>=2.1
+open_clip_torch>=2.24
+numpy>=1.24,<2.0
+pillow>=10.0
+ 
+fastapi>=0.110
+uvicorn[standard]>=0.27
+slowapi>=0.1.9
+
