@@ -58,29 +58,18 @@ def _load_cfg(config_path: Path, dataset_id: str) -> dict:
 def _resolve_paths(cfg: dict, args) -> tuple[Path, Path, Path]:
     """Return (dataset_root, emb_dir, csv_path).
 
-    Priority: CLI arg > env var > config default.
+    Priority: CLI arg > datasets.yaml value.
     """
-    if args.dataset_root:
-        dataset_root = Path(args.dataset_root)
-    else:
-        dataset_root = Path(os.environ.get(cfg["dataset_root_env"], cfg["dataset_root_default"]))
-
-    if args.out_dir:
-        emb_dir = Path(args.out_dir)
-    else:
-        emb_dir = Path(os.environ.get(cfg["emb_dir_env"], cfg["emb_dir_default"]))
+    dataset_root = Path(args.dataset_root) if args.dataset_root else Path(cfg["dataset_root"])
+    emb_dir      = Path(args.out_dir)      if args.out_dir      else Path(cfg["emb_dir"])
 
     if args.csv:
         csv_path = Path(args.csv)
     else:
-        csv_env   = cfg.get("csv_env", "")
-        from_env  = os.environ.get(csv_env, "") if csv_env else ""
-        if from_env:
-            csv_path = Path(from_env)
-        elif cfg.get("csv_relative_default"):
-            csv_path = dataset_root / cfg["csv_relative_default"]
-        else:
-            sys.exit("No CSV path configured — use --csv or set the env var declared in datasets.yaml")
+        csv_raw = cfg.get("csv") or sys.exit("No 'csv' path in datasets.yaml for this dataset")
+        csv_path = Path(csv_raw)
+        if not csv_path.is_absolute():
+            csv_path = dataset_root / csv_path
 
     return dataset_root, emb_dir, csv_path
 

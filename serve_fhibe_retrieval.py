@@ -106,17 +106,15 @@ def _clean_label(value: str, strip: bool) -> str:
 
 def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
     # --- paths ---
-    emb_dir      = Path(os.environ.get(cfg["emb_dir_env"],      cfg["emb_dir_default"]))
-    dataset_root = Path(os.environ.get(cfg["dataset_root_env"], cfg["dataset_root_default"]))
+    emb_dir      = Path(cfg["emb_dir"])
+    dataset_root = Path(cfg["dataset_root"])
 
-    csv_env_name = cfg.get("csv_env", "")
-    csv_from_env = os.environ.get(csv_env_name, "") if csv_env_name else ""
-    if csv_from_env:
-        csv_path = Path(csv_from_env)
-    elif cfg.get("csv_relative_default"):
-        csv_path = dataset_root / cfg["csv_relative_default"]
-    else:
-        raise RuntimeError(f"No CSV path configured for '{ds_id}'")
+    csv_raw = cfg.get("csv") or ""
+    if not csv_raw:
+        raise RuntimeError(f"No 'csv' path in datasets.yaml for '{ds_id}'")
+    csv_path = Path(csv_raw)
+    if not csv_path.is_absolute():
+        csv_path = dataset_root / csv_path
 
     clip_model     = cfg.get("clip_model",     "ViT-B-32")
     clip_pretrained = cfg.get("clip_pretrained", "openai")

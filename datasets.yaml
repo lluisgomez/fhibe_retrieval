@@ -3,12 +3,9 @@ datasets:
     label: "MIAP"
     clip_model: "ViT-B-32"
     clip_pretrained: "openai"
-    emb_dir_env: "MIAP_EMB_DIR"
-    emb_dir_default: "./miap_embeddings"
-    dataset_root_env: "MIAP_DATASET_ROOT"
-    dataset_root_default: "/data/datasets/MIAP"
-    csv_env: "MIAP_CSV"
-    csv_relative_default: "metadata/filtered_miap.csv"
+    dataset_root: "/data/datasets/MIAP"
+    emb_dir:      "/data/datasets/MIAP/miap_embeddings"
+    csv:          "metadata/filtered_miap.csv"
     # Images live at images/<ImageID>.jpg — no dedicated filepath column in CSV
     csv_path_template: "images/{ImageID}.jpg"
     # All rows in filtered_miap.csv are relevant; no primary-image filter needed
@@ -36,13 +33,9 @@ datasets:
     label: "PHIBE"
     clip_model: "ViT-B-32"
     clip_pretrained: "openai"
-    # Path env vars — set these on the serving machine
-    emb_dir_env: "PHIBE_EMB_DIR"
-    emb_dir_default: "./phibe_embeddings"
-    dataset_root_env: "PHIBE_DATASET_ROOT"
-    dataset_root_default: "."
-    csv_env: "PHIBE_CSV"
-    csv_relative_default: "data/processed/fhibe_downsampled/fhibe_downsampled.csv"
+    dataset_root: "/data/datasets/PHIBE/fhibe.20250716.u.gT5_rFTA_downsampled_public"
+    emb_dir:      "/data/datasets/PHIBE/phibe_embeddings"
+    csv:          "data/processed/fhibe_downsampled/fhibe_downsampled.csv"
     csv_path_col: "filepath"
     primary_filter:
       column: "is_primary"
