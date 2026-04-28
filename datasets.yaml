@@ -1,0 +1,65 @@
+datasets:
+  phibe:
+    label: "PHIBE"
+    clip_model: "ViT-B-32"
+    clip_pretrained: "openai"
+    # Path env vars — set these on the serving machine
+    emb_dir_env: "PHIBE_EMB_DIR"
+    emb_dir_default: "./phibe_embeddings"
+    dataset_root_env: "PHIBE_DATASET_ROOT"
+    dataset_root_default: "."
+    csv_env: "PHIBE_CSV"
+    csv_relative_default: "data/processed/fhibe_downsampled/fhibe_downsampled.csv"
+    csv_path_col: "filepath"
+    primary_filter:
+      column: "is_primary"
+      value: "true"
+    strip_numeric_prefix: true
+    age_buckets:
+      - ["0-12 (child)",        0,  13]
+      - ["13-17 (teen)",       13,  18]
+      - ["18-29 (young adult)", 18,  30]
+      - ["30-49 (adult)",      30,  50]
+      - ["50-64 (older adult)", 50,  65]
+      - ["65+ (senior)",       65, 200]
+    metadata_columns:
+      - subject_id
+      - age
+      - pronoun
+      - nationality
+      - ancestry
+      - apparent_skin_color
+      - hairstyle
+      - apparent_hair_type
+      - apparent_hair_color
+      - facial_hairstyle
+      - apparent_left_eye_color
+      - apparent_right_eye_color
+      - scene
+      - lighting
+      - weather
+      - action_body_pose
+      - action_subject_object_interaction
+      - camera_position
+      - camera_distance
+      - manufacturer
+      - model
+      - location_country
+      - location_region
+    filter_fields:
+      - field: nationality
+        label: "Nationality"
+      - field: ancestry
+        label: "Ancestry"
+      - field: pronoun
+        label: "Pronoun"
+      - field: apparent_skin_color
+        label: "Apparent skin color"
+      - field: scene
+        label: "Scene"
+      - field: action_body_pose
+        label: "Body pose"
+      - field: age_bucket
+        label: "Age"
+        derived_from: age
+        derived_type: age_bucket

@@ -1,5 +1,5 @@
 """
-FHIBE text-to-image retrieval server.
+Text-to-image retrieval server.
 
 Single FastAPI app that:
   - loads CLIP ViT-B/32 text encoder + precomputed image embeddings at startup
@@ -7,30 +7,34 @@ Single FastAPI app that:
   - serves thumbnails (fast, ~30KB JPEGs) and full original PNGs
   - renders a minimal HTML page with a search box, grid, and detail modal
 
+Dataset is selected via the DATASET env var (must match a key in datasets.yaml).
+Path env vars (emb_dir, dataset_root, csv) are defined per-dataset in datasets.yaml.
+
 Layout expected on disk:
   EMB_DIR/
     embeddings.npz          # {'embeddings': (N,512) float16, 'paths': (N,) str}
     thumbnails/<relpath>.jpg
-  DATASET_ROOT/              # original PNGs live here, under the paths in embeddings.npz
-  CSV_PATH                   # fhibe_downsampled.csv (for per-image metadata)
+  DATASET_ROOT/              # original images live here, under the paths in embeddings.npz
 
 Usage:
-  pip install fastapi uvicorn[standard] open_clip_torch torch pillow numpy slowapi
-  export FHIBE_EMB_DIR=/path/to/fhibe_embeddings
-  export FHIBE_DATASET_ROOT=/path/to/fhibe.20250716.u..._public
-  export FHIBE_CSV=/path/to/fhibe_downsampled.csv
-  uvicorn serve_fhibe:app --host 0.0.0.0 --port 8000 --workers 1
+  export DATASET=phibe
+  export PHIBE_EMB_DIR=/path/to/phibe_embeddings
+  export PHIBE_DATASET_ROOT=/path/to/phibe_dataset
+  uvicorn serve_fhibe_retrieval:app --host 0.0.0.0 --port 8000 --workers 1
 """
 
 import csv
 import os
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import open_clip
 import torch
+import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -39,57 +43,47 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-import open_clip
-
 csv.field_size_limit(sys.maxsize)
 
 # ----------------------------------------------------------------------------
-# Config via env vars (easier to swap paths without editing code)
+# Load dataset config from datasets.yaml
 # ----------------------------------------------------------------------------
-EMB_DIR = Path(os.environ.get("FHIBE_EMB_DIR", "./fhibe_embeddings"))
-DATASET_ROOT = Path(os.environ.get("FHIBE_DATASET_ROOT", "."))
-CSV_PATH = Path(
-    os.environ.get(
-        "FHIBE_CSV",
-        str(DATASET_ROOT / "data/processed/fhibe_downsampled/fhibe_downsampled.csv"),
-    )
-)
-MODEL_NAME = os.environ.get("FHIBE_MODEL", "ViT-B-32")
-PRETRAINED = os.environ.get("FHIBE_PRETRAINED", "openai")
-MAX_K = 100      # max per-page size (pagination)
-DEFAULT_K = 30   # default page size
+_CONFIG_PATH = Path(os.environ.get("DATASETS_CONFIG", "./datasets.yaml"))
+DATASET_ID = os.environ.get("DATASET", "phibe")
 
-# Columns to expose in the detail view (subset of 77 — keep it human-readable)
-METADATA_COLUMNS = [
-    "subject_id", "age", "pronoun", "nationality", "ancestry",
-    "apparent_skin_color", "hairstyle", "apparent_hair_type",
-    "apparent_hair_color", "facial_hairstyle", "apparent_left_eye_color",
-    "apparent_right_eye_color", "scene", "lighting", "weather",
-    "action_body_pose", "action_subject_object_interaction",
-    "camera_position", "camera_distance", "manufacturer", "model",
-    "location_country", "location_region",
-]
+with open(_CONFIG_PATH) as _f:
+    _all_datasets = yaml.safe_load(_f)
 
-# Fields exposed as multi-select filters in the UI.
-# `derived` means we compute the value from a different column (see build_filter_value).
-FILTER_FIELDS = [
-    {"field": "nationality",          "label": "Nationality"},
-    {"field": "ancestry",             "label": "Ancestry"},
-    {"field": "pronoun",              "label": "Pronoun"},
-    {"field": "apparent_skin_color",  "label": "Apparent skin color"},
-    {"field": "scene",                "label": "Scene"},
-    {"field": "action_body_pose",     "label": "Body pose"},
-    {"field": "age_bucket",           "label": "Age", "derived": True},
-]
+if DATASET_ID not in _all_datasets["datasets"]:
+    raise RuntimeError(f"Dataset '{DATASET_ID}' not found in {_CONFIG_PATH}. Available: {list(_all_datasets['datasets'])}")
 
-AGE_BUCKETS = [
-    ("0-12 (child)",       0, 13),
-    ("13-17 (teen)",       13, 18),
-    ("18-29 (young adult)", 18, 30),
-    ("30-49 (adult)",      30, 50),
-    ("50-64 (older adult)", 50, 65),
-    ("65+ (senior)",       65, 200),
-]
+_cfg = _all_datasets["datasets"][DATASET_ID]
+
+# Resolve paths via env vars declared in the config, with per-dataset defaults
+EMB_DIR = Path(os.environ.get(_cfg["emb_dir_env"], _cfg["emb_dir_default"]))
+DATASET_ROOT = Path(os.environ.get(_cfg["dataset_root_env"], _cfg["dataset_root_default"]))
+
+_csv_env_name = _cfg.get("csv_env", "")
+_csv_from_env = os.environ.get(_csv_env_name, "") if _csv_env_name else ""
+if _csv_from_env:
+    CSV_PATH = Path(_csv_from_env)
+elif _cfg.get("csv_relative_default"):
+    CSV_PATH = DATASET_ROOT / _cfg["csv_relative_default"]
+else:
+    raise RuntimeError(f"No CSV path configured for dataset '{DATASET_ID}'")
+
+MODEL_NAME  = _cfg.get("clip_model", "ViT-B-32")
+PRETRAINED  = _cfg.get("clip_pretrained", "openai")
+
+DATASET_LABEL        = _cfg.get("label", DATASET_ID.upper())
+METADATA_COLUMNS     = _cfg["metadata_columns"]
+FILTER_FIELDS        = _cfg["filter_fields"]
+AGE_BUCKETS          = [tuple(b) for b in _cfg.get("age_buckets", [])]
+STRIP_NUMERIC_PREFIX = _cfg.get("strip_numeric_prefix", False)
+CSV_PATH_COL         = _cfg.get("csv_path_col", "filepath")
+
+MAX_K     = 100
+DEFAULT_K = 30
 
 
 def age_to_bucket(raw: str) -> str:
@@ -105,19 +99,20 @@ def age_to_bucket(raw: str) -> str:
 
 
 def clean_label(value: str) -> str:
-    """Strip 'N. ' or 'NN. ' prefix used in FHIBE categorical values for display."""
-    if not value:
+    """Strip 'N. ' or 'NN. ' numeric prefix used in some datasets (e.g. PHIBE)."""
+    if not value or not STRIP_NUMERIC_PREFIX:
         return value
-    # e.g. "12. Indoor: Home or hotel" -> "Indoor: Home or hotel"
     parts = value.split(". ", 1)
     if len(parts) == 2 and parts[0].strip().isdigit():
         return parts[1]
     return value
 
+
 # ----------------------------------------------------------------------------
 # Load artifacts at startup
 # ----------------------------------------------------------------------------
-print(f"[startup] loading embeddings from {EMB_DIR/'embeddings.npz'}")
+print(f"[startup] dataset={DATASET_ID!r}  label={DATASET_LABEL!r}")
+print(f"[startup] loading embeddings from {EMB_DIR / 'embeddings.npz'}")
 _d = np.load(EMB_DIR / "embeddings.npz", allow_pickle=True)
 EMBEDDINGS: np.ndarray = _d["embeddings"].astype(np.float32)  # (N, 512) for CPU matmul
 PATHS: list[str] = [str(p) for p in _d["paths"]]
@@ -134,42 +129,40 @@ print("[startup] model loaded, vision tower discarded")
 
 print(f"[startup] loading metadata from {CSV_PATH}")
 METADATA: dict[str, dict] = {}
-# For each filter field, a list aligned with PATHS: FILTER_VALUES[field][i] = value for image i
 FILTER_VALUES: dict[str, list[str]] = {f["field"]: [""] * len(PATHS) for f in FILTER_FIELDS}
 
 _csv_rows_by_path: dict[str, dict] = {}
 with open(CSV_PATH, newline="") as f:
     reader = csv.DictReader(f)
     for row in reader:
-        fp = row["filepath"]
+        fp = row[CSV_PATH_COL]
         METADATA[fp] = {k: row.get(k, "") for k in METADATA_COLUMNS}
         _csv_rows_by_path[fp] = row
 
-# Populate FILTER_VALUES in the order of PATHS so index i lines up with EMBEDDINGS[i]
 for i, p in enumerate(PATHS):
     row = _csv_rows_by_path.get(p)
     if not row:
         continue
     for fdef in FILTER_FIELDS:
         field = fdef["field"]
-        if fdef.get("derived") and field == "age_bucket":
-            FILTER_VALUES[field][i] = age_to_bucket(row.get("age", ""))
+        if fdef.get("derived_type") == "age_bucket":
+            src_col = fdef.get("derived_from", "age")
+            FILTER_VALUES[field][i] = age_to_bucket(row.get(src_col, ""))
         else:
             FILTER_VALUES[field][i] = row.get(field, "") or ""
 del _csv_rows_by_path
 
-# Catalog: for each filter field, the sorted list of distinct values + display labels.
-# Sent to the UI so it can render the multi-select dropdowns.
 FILTER_OPTIONS: dict[str, list[dict]] = {}
 for fdef in FILTER_FIELDS:
     field = fdef["field"]
     vals = sorted({v for v in FILTER_VALUES[field] if v})
-    # Preserve FHIBE's numeric-prefix ordering: "0. Standing" < "10. ..." when sorted as numbers
+
     def _sort_key(v: str):
         parts = v.split(". ", 1)
-        if len(parts) == 2 and parts[0].strip().isdigit():
+        if STRIP_NUMERIC_PREFIX and len(parts) == 2 and parts[0].strip().isdigit():
             return (0, int(parts[0]))
         return (1, v)
+
     vals.sort(key=_sort_key)
     FILTER_OPTIONS[field] = [{"value": v, "label": clean_label(v)} for v in vals]
     print(f"[startup] filter '{field}': {len(vals)} distinct values")
@@ -178,7 +171,7 @@ print(f"[startup] metadata for {len(METADATA)} rows")
 
 
 def encode_text(query: str) -> np.ndarray:
-    """Return L2-normalized (512,) float32 text embedding."""
+    """Return L2-normalized (D,) float32 text embedding."""
     with torch.inference_mode():
         tok = _tokenizer([query])
         vec = _model.encode_text(tok).float()
@@ -186,14 +179,10 @@ def encode_text(query: str) -> np.ndarray:
     return vec.squeeze(0).numpy()
 
 
-from functools import lru_cache
+def _filter_mask(filters_key: tuple) -> Optional[np.ndarray]:
+    """Return a (N,) boolean mask for the given filter tuple, or None if no filters.
 
-
-def _filter_mask(filters_key: tuple[tuple[str, tuple[str, ...]], ...]) -> Optional[np.ndarray]:
-    """Given a normalized filter tuple, return a (N,) boolean mask, or None if no filters.
-
-    filters_key is a tuple of (field, tuple_of_allowed_values). Within a field it's OR,
-    across fields it's AND.
+    Within a field: OR logic. Across fields: AND logic.
     """
     if not filters_key:
         return None
@@ -210,21 +199,15 @@ def _filter_mask(filters_key: tuple[tuple[str, tuple[str, ...]], ...]) -> Option
 
 @lru_cache(maxsize=256)
 def _rank(query: str, filters_key: tuple) -> tuple[np.ndarray, np.ndarray]:
-    """Return (sorted_indices, sorted_scores) after applying filters.
-
-    If query is empty, returns filtered indices in original CSV order with zero scores.
-    If query is present, ranks by cosine similarity among matching rows only.
-    Cached per (query, filters) pair.
-    """
+    """Return (sorted_indices, sorted_scores) after applying filters. LRU-cached."""
     t0 = time.time()
     mask = _filter_mask(filters_key)
 
     if query:
-        qvec = encode_text(query)              # (512,)
-        sims = EMBEDDINGS @ qvec               # (N,) float32
+        qvec = encode_text(query)
+        sims = EMBEDDINGS @ qvec
         if mask is not None:
             sims = np.where(mask, sims, -np.inf)
-            # argsort moves -inf to the end; we trim them off
             order = np.argsort(-sims)
             n_valid = int(mask.sum())
             order = order[:n_valid]
@@ -233,7 +216,6 @@ def _rank(query: str, filters_key: tuple) -> tuple[np.ndarray, np.ndarray]:
             order = np.argsort(-sims)
             sorted_scores = sims[order]
     else:
-        # No query: just return filtered indices in original order, scores = 0
         if mask is None:
             order = np.arange(len(PATHS))
         else:
@@ -246,12 +228,7 @@ def _rank(query: str, filters_key: tuple) -> tuple[np.ndarray, np.ndarray]:
     return order, sorted_scores
 
 
-def search_page(
-    query: str,
-    filters_key: tuple,
-    offset: int,
-    limit: int,
-) -> tuple[list[dict], int]:
+def search_page(query: str, filters_key: tuple, offset: int, limit: int) -> tuple[list[dict], int]:
     """Return a slice of ranked/filtered results plus the total count."""
     order, sorted_scores = _rank(query, filters_key)
     total = len(order)
@@ -260,11 +237,7 @@ def search_page(
     page_idx = order[offset : offset + limit]
     page_scores = sorted_scores[offset : offset + limit]
     results = [
-        {
-            "path": PATHS[int(i)],
-            "score": float(s),
-            "rank": offset + k,
-        }
+        {"path": PATHS[int(i)], "score": float(s), "rank": offset + k}
         for k, (i, s) in enumerate(zip(page_idx, page_scores))
     ]
     return results, total
@@ -274,7 +247,7 @@ def search_page(
 # FastAPI app
 # ----------------------------------------------------------------------------
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="FHIBE text-to-image search")
+app = FastAPI(title=f"{DATASET_LABEL} text-to-image search")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
@@ -284,7 +257,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount thumbnails as static files — nginx can later short-circuit this path for speed
 app.mount(
     "/thumbnails",
     StaticFiles(directory=str(EMB_DIR / "thumbnails")),
@@ -299,24 +271,16 @@ def health():
 
 @app.get("/filters")
 def filters_endpoint():
-    """Return the catalog of filter fields and their available values for the UI."""
     return JSONResponse({
         "fields": [
-            {
-                "field": f["field"],
-                "label": f["label"],
-                "options": FILTER_OPTIONS[f["field"]],
-            }
+            {"field": f["field"], "label": f["label"], "options": FILTER_OPTIONS[f["field"]]}
             for f in FILTER_FIELDS
         ],
     })
 
 
 def _parse_filters(raw: list[str]) -> tuple:
-    """Parse ['nationality:Filipino', 'scene:12. Indoor: ...'] into a sorted tuple suitable as cache key.
-
-    Within a field, multiple values OR together. Across fields, AND.
-    """
+    """Parse ['nationality:Filipino', 'scene:12. Indoor: ...'] into a sorted tuple cache key."""
     valid_fields = {f["field"] for f in FILTER_FIELDS}
     by_field: dict[str, set[str]] = {}
     for item in raw:
@@ -326,7 +290,6 @@ def _parse_filters(raw: list[str]) -> tuple:
         if field not in valid_fields:
             continue
         by_field.setdefault(field, set()).add(value)
-    # Sort everything so equivalent filter sets produce identical cache keys
     return tuple(sorted(
         (field, tuple(sorted(values)))
         for field, values in by_field.items()
@@ -340,7 +303,7 @@ def search_endpoint(
     q: str = "",
     offset: int = 0,
     limit: int = DEFAULT_K,
-    filter: list[str] = Query(default_factory=list),  # noqa: B008 — FastAPI idiom
+    filter: list[str] = Query(default_factory=list),
 ):
     q = q.strip()
     filters_key = _parse_filters(filter)
@@ -372,29 +335,28 @@ def search_endpoint(
 @app.get("/image")
 @limiter.limit("60/minute")
 def full_image(request: Request, path: str):
-    """Serve the original PNG. Validate path is one we know about (prevents LFI)."""
+    """Serve the original image. Validates path is known (prevents LFI)."""
     if path not in PATH_TO_IDX:
         raise HTTPException(404, "unknown image")
     full = (DATASET_ROOT / path).resolve()
-    # Defense in depth: ensure resolved path is still under DATASET_ROOT
     try:
         full.relative_to(DATASET_ROOT.resolve())
     except ValueError:
         raise HTTPException(403, "path escape")
     if not full.is_file():
         raise HTTPException(404, "file missing on disk")
-    return FileResponse(full, media_type="image/png")
+    return FileResponse(full)
 
 
 # ----------------------------------------------------------------------------
 # Minimal single-page UI
 # ----------------------------------------------------------------------------
-INDEX_HTML = r"""<!doctype html>
+_INDEX_HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FHIBE search</title>
+<title>__DATASET_LABEL__ search</title>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
@@ -429,7 +391,7 @@ INDEX_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-<h1>FHIBE text-to-image search</h1>
+<h1>__DATASET_LABEL__ text-to-image search</h1>
 <form id="f">
   <input id="q" type="text" placeholder="describe what you're looking for (or leave empty and use filters only)...">
   <button type="submit">Search</button>
@@ -456,10 +418,8 @@ const modalImg = document.getElementById('modal-img');
 const metaDiv = document.getElementById('meta');
 const filtersBar = document.getElementById('filters');
 
-// Selected filter values: { field: Set<value> }
 const selected = new Map();
-
-let filterCatalog = [];  // fetched from /filters
+let filterCatalog = [];
 
 let state = {
   query: '',
@@ -501,13 +461,10 @@ function renderFilterBar() {
         const s = selected.get(fdef.field);
         if (cb.checked) s.add(opt.value); else s.delete(opt.value);
         if (s.size === 0) selected.delete(fdef.field);
-        // Re-run the current search with new filters
         triggerSearch();
-        // Update the pill label
         renderFilterBar();
       });
       lbl.appendChild(cb);
-      // For skin-color fields, show a swatch before the label text
       const swatch = renderSwatch(fdef.field, opt.value);
       if (swatch) lbl.insertAdjacentHTML('beforeend', swatch);
       lbl.appendChild(document.createTextNode(' ' + opt.label));
@@ -515,7 +472,6 @@ function renderFilterBar() {
     }
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      // Close other open popups
       for (const el of document.querySelectorAll('.filter-pop.open')) {
         if (el !== pop) el.classList.remove('open');
       }
@@ -539,7 +495,6 @@ function renderFilterBar() {
   }
 }
 
-// Close filter popups when clicking outside
 document.addEventListener('click', (e) => {
   if (!e.target.closest('.filter-pop') && !e.target.closest('.filter-btn')) {
     for (const el of document.querySelectorAll('.filter-pop.open')) el.classList.remove('open');
@@ -559,7 +514,6 @@ async function fetchPage() {
     ].filter(Boolean).join('&');
     const res = await fetch('/search?' + qs);
     if (res.status === 400) {
-      // Probably no query and no filters
       sentinel.textContent = '';
       state.loading = false;
       state.hasMore = false;
@@ -601,7 +555,6 @@ async function fetchPage() {
 
 function triggerSearch() {
   const q = document.getElementById('q').value.trim();
-  // Don't issue a request if there's nothing to search for at all
   if (!q && selected.size === 0) {
     grid.innerHTML = '';
     state.hasMore = false;
@@ -641,8 +594,6 @@ function openModal(r) {
 function closeModal() { modal.classList.remove('open'); modalImg.src = ''; }
 function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
 
-// If `field` is a skin-color field and `value` looks like "N. [R, G, B]",
-// return an inline-block color-swatch HTML snippet. Otherwise return ''.
 function renderSwatch(field, value) {
   if (!/skin_color/.test(field)) return '';
   const m = /\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(value || '');
@@ -653,7 +604,6 @@ function renderSwatch(field, value) {
 
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
-// Bootstrap: fetch filter catalog before user does anything
 (async () => {
   try {
     const res = await fetch('/filters');
@@ -669,6 +619,8 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal
 </body>
 </html>
 """
+
+INDEX_HTML = _INDEX_HTML_TEMPLATE.replace("__DATASET_LABEL__", DATASET_LABEL)
 
 
 @app.get("/", response_class=HTMLResponse)
