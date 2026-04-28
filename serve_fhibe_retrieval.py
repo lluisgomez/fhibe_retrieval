@@ -1,23 +1,17 @@
 """
-Text-to-image retrieval server.
+Text-to-image retrieval server — multi-dataset edition.
 
-Single FastAPI app that:
-  - loads CLIP ViT-B/32 text encoder + precomputed image embeddings at startup
-  - exposes GET /search?q=...&k=20 returning top-K matches with metadata
-  - serves thumbnails (fast, ~30KB JPEGs) and full original PNGs
-  - renders a minimal HTML page with a search box, grid, and detail modal
+Loads every dataset declared in datasets.yaml at startup.  The UI shows a
+tab-switcher when more than one dataset is available.
 
-Dataset is selected via the DATASET env var (must match a key in datasets.yaml).
-Path env vars (emb_dir, dataset_root, csv) are defined per-dataset in datasets.yaml.
-
-Layout expected on disk:
-  EMB_DIR/
-    embeddings.npz          # {'embeddings': (N,512) float16, 'paths': (N,) str}
-    thumbnails/<relpath>.jpg
-  DATASET_ROOT/              # original images live here, under the paths in embeddings.npz
+Endpoints:
+  GET /datasets                        list available datasets
+  GET /filters?dataset=<id>            filter catalog for a dataset
+  GET /search?dataset=<id>&q=...       ranked search with pagination
+  GET /image?dataset=<id>&path=...     serve original image
+  GET /thumbnails/<id>/<path>          static thumbnails (StaticFiles)
 
 Usage:
-  export DATASET=phibe
   export PHIBE_EMB_DIR=/path/to/phibe_embeddings
   export PHIBE_DATASET_ROOT=/path/to/phibe_dataset
   uvicorn serve_fhibe_retrieval:app --host 0.0.0.0 --port 8000 --workers 1
@@ -27,6 +21,7 @@ import csv
 import os
 import sys
 import time
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -45,62 +40,63 @@ from slowapi.util import get_remote_address
 
 csv.field_size_limit(sys.maxsize)
 
-# ----------------------------------------------------------------------------
-# Load dataset config from datasets.yaml
-# ----------------------------------------------------------------------------
-_CONFIG_PATH = Path(os.environ.get("DATASETS_CONFIG", "./datasets.yaml"))
-DATASET_ID = os.environ.get("DATASET", "phibe")
-
-with open(_CONFIG_PATH) as _f:
-    _all_datasets = yaml.safe_load(_f)
-
-if DATASET_ID not in _all_datasets["datasets"]:
-    raise RuntimeError(f"Dataset '{DATASET_ID}' not found in {_CONFIG_PATH}. Available: {list(_all_datasets['datasets'])}")
-
-_cfg = _all_datasets["datasets"][DATASET_ID]
-
-# Resolve paths via env vars declared in the config, with per-dataset defaults
-EMB_DIR = Path(os.environ.get(_cfg["emb_dir_env"], _cfg["emb_dir_default"]))
-DATASET_ROOT = Path(os.environ.get(_cfg["dataset_root_env"], _cfg["dataset_root_default"]))
-
-_csv_env_name = _cfg.get("csv_env", "")
-_csv_from_env = os.environ.get(_csv_env_name, "") if _csv_env_name else ""
-if _csv_from_env:
-    CSV_PATH = Path(_csv_from_env)
-elif _cfg.get("csv_relative_default"):
-    CSV_PATH = DATASET_ROOT / _cfg["csv_relative_default"]
-else:
-    raise RuntimeError(f"No CSV path configured for dataset '{DATASET_ID}'")
-
-MODEL_NAME  = _cfg.get("clip_model", "ViT-B-32")
-PRETRAINED  = _cfg.get("clip_pretrained", "openai")
-
-DATASET_LABEL        = _cfg.get("label", DATASET_ID.upper())
-METADATA_COLUMNS     = _cfg["metadata_columns"]
-FILTER_FIELDS        = _cfg["filter_fields"]
-AGE_BUCKETS          = [tuple(b) for b in _cfg.get("age_buckets", [])]
-STRIP_NUMERIC_PREFIX = _cfg.get("strip_numeric_prefix", False)
-CSV_PATH_COL         = _cfg.get("csv_path_col", "filepath")
-
 MAX_K     = 100
 DEFAULT_K = 30
 
+# ----------------------------------------------------------------------------
+# CLIP model cache — one model loaded per unique (model, pretrained) pair
+# ----------------------------------------------------------------------------
 
-def age_to_bucket(raw: str) -> str:
-    """Turn '24' into '18-29 (young adult)'. Returns '' if unparseable."""
+_clip_models: dict[tuple[str, str], tuple] = {}
+
+
+def _get_clip(model_name: str, pretrained: str) -> tuple:
+    key = (model_name, pretrained)
+    if key not in _clip_models:
+        print(f"[startup] loading CLIP {model_name}/{pretrained}")
+        m, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+        m = m.eval()
+        m.visual = None  # free vision tower — text-only at serve time
+        tok = open_clip.get_tokenizer(model_name)
+        _clip_models[key] = (m, tok)
+        print(f"[startup] {model_name}/{pretrained} ready")
+    return _clip_models[key]
+
+
+# ----------------------------------------------------------------------------
+# Per-dataset runtime state
+# ----------------------------------------------------------------------------
+
+@dataclass
+class DatasetState:
+    id: str
+    label: str
+    clip_key: tuple[str, str]
+    embeddings: np.ndarray          # (N, D) float32
+    paths: list[str]
+    path_to_idx: dict[str, int]
+    metadata: dict[str, dict]       # path -> metadata dict
+    filter_values: dict[str, list[str]]   # field -> list aligned with paths
+    filter_options: dict[str, list[dict]] # field -> [{value, label}, ...]
+    filter_fields: list[dict]
+    metadata_columns: list[str]
+    dataset_root: Path
+    emb_dir: Path
+
+
+def _age_to_bucket(raw: str, buckets: list) -> str:
     try:
         a = int(float(raw))
     except (ValueError, TypeError):
         return ""
-    for label, lo, hi in AGE_BUCKETS:
+    for label, lo, hi in buckets:
         if lo <= a < hi:
             return label
     return ""
 
 
-def clean_label(value: str) -> str:
-    """Strip 'N. ' or 'NN. ' numeric prefix used in some datasets (e.g. PHIBE)."""
-    if not value or not STRIP_NUMERIC_PREFIX:
+def _clean_label(value: str, strip: bool) -> str:
+    if not value or not strip:
         return value
     parts = value.split(". ", 1)
     if len(parts) == 2 and parts[0].strip().isdigit():
@@ -108,205 +104,261 @@ def clean_label(value: str) -> str:
     return value
 
 
-# ----------------------------------------------------------------------------
-# Load artifacts at startup
-# ----------------------------------------------------------------------------
-print(f"[startup] dataset={DATASET_ID!r}  label={DATASET_LABEL!r}")
-print(f"[startup] loading embeddings from {EMB_DIR / 'embeddings.npz'}")
-_d = np.load(EMB_DIR / "embeddings.npz", allow_pickle=True)
-EMBEDDINGS: np.ndarray = _d["embeddings"].astype(np.float32)  # (N, 512) for CPU matmul
-PATHS: list[str] = [str(p) for p in _d["paths"]]
-PATH_TO_IDX: dict[str, int] = {p: i for i, p in enumerate(PATHS)}
-print(f"[startup] {EMBEDDINGS.shape[0]} embeddings loaded, dim={EMBEDDINGS.shape[1]}")
+def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
+    # --- paths ---
+    emb_dir      = Path(os.environ.get(cfg["emb_dir_env"],      cfg["emb_dir_default"]))
+    dataset_root = Path(os.environ.get(cfg["dataset_root_env"], cfg["dataset_root_default"]))
 
-print(f"[startup] loading CLIP text encoder: {MODEL_NAME}/{PRETRAINED}")
-_model, _, _ = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
-_model = _model.eval()
-_tokenizer = open_clip.get_tokenizer(MODEL_NAME)
-# Free vision tower — we only need text at query time
-_model.visual = None
-print("[startup] model loaded, vision tower discarded")
+    csv_env_name = cfg.get("csv_env", "")
+    csv_from_env = os.environ.get(csv_env_name, "") if csv_env_name else ""
+    if csv_from_env:
+        csv_path = Path(csv_from_env)
+    elif cfg.get("csv_relative_default"):
+        csv_path = dataset_root / cfg["csv_relative_default"]
+    else:
+        raise RuntimeError(f"No CSV path configured for '{ds_id}'")
 
-print(f"[startup] loading metadata from {CSV_PATH}")
-METADATA: dict[str, dict] = {}
-FILTER_VALUES: dict[str, list[str]] = {f["field"]: [""] * len(PATHS) for f in FILTER_FIELDS}
+    clip_model     = cfg.get("clip_model",     "ViT-B-32")
+    clip_pretrained = cfg.get("clip_pretrained", "openai")
+    clip_key       = (clip_model, clip_pretrained)
+    strip          = cfg.get("strip_numeric_prefix", False)
+    csv_path_col   = cfg.get("csv_path_col", "filepath")
+    filter_fields  = cfg["filter_fields"]
+    meta_columns   = cfg["metadata_columns"]
+    age_buckets    = [tuple(b) for b in cfg.get("age_buckets", [])]
 
-_csv_rows_by_path: dict[str, dict] = {}
-with open(CSV_PATH, newline="") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        fp = row[CSV_PATH_COL]
-        METADATA[fp] = {k: row.get(k, "") for k in METADATA_COLUMNS}
-        _csv_rows_by_path[fp] = row
+    # --- embeddings ---
+    emb_file = emb_dir / "embeddings.npz"
+    print(f"[{ds_id}] loading embeddings from {emb_file}")
+    d = np.load(emb_file, allow_pickle=True)
+    embeddings  = d["embeddings"].astype(np.float32)
+    paths       = [str(p) for p in d["paths"]]
+    path_to_idx = {p: i for i, p in enumerate(paths)}
+    print(f"[{ds_id}] {embeddings.shape[0]} embeddings, dim={embeddings.shape[1]}")
 
-for i, p in enumerate(PATHS):
-    row = _csv_rows_by_path.get(p)
-    if not row:
-        continue
-    for fdef in FILTER_FIELDS:
+    # preload CLIP (shared across datasets with the same key)
+    _get_clip(clip_model, clip_pretrained)
+
+    # --- metadata + filter values ---
+    print(f"[{ds_id}] loading metadata from {csv_path}")
+    metadata: dict[str, dict] = {}
+    filter_values: dict[str, list[str]] = {f["field"]: [""] * len(paths) for f in filter_fields}
+
+    csv_rows: dict[str, dict] = {}
+    with open(csv_path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            fp = row[csv_path_col]
+            metadata[fp] = {k: row.get(k, "") for k in meta_columns}
+            csv_rows[fp] = row
+
+    for i, p in enumerate(paths):
+        row = csv_rows.get(p)
+        if not row:
+            continue
+        for fdef in filter_fields:
+            field = fdef["field"]
+            if fdef.get("derived_type") == "age_bucket":
+                src = fdef.get("derived_from", "age")
+                filter_values[field][i] = _age_to_bucket(row.get(src, ""), age_buckets)
+            else:
+                filter_values[field][i] = row.get(field, "") or ""
+
+    # --- filter options (sorted display list per field) ---
+    filter_options: dict[str, list[dict]] = {}
+    for fdef in filter_fields:
         field = fdef["field"]
-        if fdef.get("derived_type") == "age_bucket":
-            src_col = fdef.get("derived_from", "age")
-            FILTER_VALUES[field][i] = age_to_bucket(row.get(src_col, ""))
-        else:
-            FILTER_VALUES[field][i] = row.get(field, "") or ""
-del _csv_rows_by_path
+        vals  = list({v for v in filter_values[field] if v})
 
-FILTER_OPTIONS: dict[str, list[dict]] = {}
-for fdef in FILTER_FIELDS:
-    field = fdef["field"]
-    vals = sorted({v for v in FILTER_VALUES[field] if v})
+        def _sort_key(v: str, _s=strip) -> tuple:
+            parts = v.split(". ", 1)
+            if _s and len(parts) == 2 and parts[0].strip().isdigit():
+                return (0, int(parts[0]))
+            return (1, v)
 
-    def _sort_key(v: str):
-        parts = v.split(". ", 1)
-        if STRIP_NUMERIC_PREFIX and len(parts) == 2 and parts[0].strip().isdigit():
-            return (0, int(parts[0]))
-        return (1, v)
+        vals.sort(key=_sort_key)
+        filter_options[field] = [{"value": v, "label": _clean_label(v, strip)} for v in vals]
+        print(f"[{ds_id}] filter '{field}': {len(vals)} distinct values")
 
-    vals.sort(key=_sort_key)
-    FILTER_OPTIONS[field] = [{"value": v, "label": clean_label(v)} for v in vals]
-    print(f"[startup] filter '{field}': {len(vals)} distinct values")
-
-print(f"[startup] metadata for {len(METADATA)} rows")
+    print(f"[{ds_id}] metadata for {len(metadata)} rows")
+    return DatasetState(
+        id=ds_id, label=cfg.get("label", ds_id.upper()), clip_key=clip_key,
+        embeddings=embeddings, paths=paths, path_to_idx=path_to_idx,
+        metadata=metadata, filter_values=filter_values, filter_options=filter_options,
+        filter_fields=filter_fields, metadata_columns=meta_columns,
+        dataset_root=dataset_root, emb_dir=emb_dir,
+    )
 
 
-def encode_text(query: str) -> np.ndarray:
+# ----------------------------------------------------------------------------
+# Load all datasets declared in datasets.yaml
+# ----------------------------------------------------------------------------
+
+_CONFIG_PATH = Path(os.environ.get("DATASETS_CONFIG", "./datasets.yaml"))
+with open(_CONFIG_PATH) as _f:
+    _all_config = yaml.safe_load(_f)
+
+DATASETS: dict[str, DatasetState] = {}
+for _ds_id, _ds_cfg in _all_config["datasets"].items():
+    try:
+        DATASETS[_ds_id] = _load_dataset(_ds_id, _ds_cfg)
+    except Exception as _e:
+        print(f"[warn] skipping dataset '{_ds_id}': {_e}")
+
+if not DATASETS:
+    raise RuntimeError("No datasets loaded successfully — check datasets.yaml and env vars")
+
+DEFAULT_DATASET_ID = next(iter(DATASETS))
+print(f"[startup] datasets ready: {list(DATASETS)}  default={DEFAULT_DATASET_ID!r}")
+
+
+# ----------------------------------------------------------------------------
+# Search helpers
+# ----------------------------------------------------------------------------
+
+def encode_text(query: str, clip_key: tuple[str, str]) -> np.ndarray:
     """Return L2-normalized (D,) float32 text embedding."""
+    model, tokenizer = _get_clip(*clip_key)
     with torch.inference_mode():
-        tok = _tokenizer([query])
-        vec = _model.encode_text(tok).float()
+        tok = tokenizer([query])
+        vec = model.encode_text(tok).float()
         vec = vec / vec.norm(dim=-1, keepdim=True)
     return vec.squeeze(0).numpy()
 
 
-def _filter_mask(filters_key: tuple) -> Optional[np.ndarray]:
-    """Return a (N,) boolean mask for the given filter tuple, or None if no filters.
-
-    Within a field: OR logic. Across fields: AND logic.
-    """
+@lru_cache(maxsize=512)
+def _filter_mask(dataset_id: str, filters_key: tuple) -> Optional[np.ndarray]:
+    """(N,) boolean mask for filters_key, or None if no filters. Within-field OR, cross-field AND."""
     if not filters_key:
         return None
-    mask = np.ones(len(PATHS), dtype=bool)
+    ds = DATASETS[dataset_id]
+    mask = np.ones(len(ds.paths), dtype=bool)
     for field, allowed in filters_key:
         if not allowed:
             continue
         allowed_set = set(allowed)
-        field_vals = FILTER_VALUES[field]
-        field_mask = np.fromiter((v in allowed_set for v in field_vals), count=len(PATHS), dtype=bool)
-        mask &= field_mask
+        fv = ds.filter_values[field]
+        mask &= np.fromiter((v in allowed_set for v in fv), count=len(ds.paths), dtype=bool)
     return mask
 
 
-@lru_cache(maxsize=256)
-def _rank(query: str, filters_key: tuple) -> tuple[np.ndarray, np.ndarray]:
-    """Return (sorted_indices, sorted_scores) after applying filters. LRU-cached."""
+@lru_cache(maxsize=512)
+def _rank(dataset_id: str, query: str, filters_key: tuple) -> tuple[np.ndarray, np.ndarray]:
+    """Return (sorted_indices, sorted_scores). LRU-cached per (dataset, query, filters)."""
     t0 = time.time()
-    mask = _filter_mask(filters_key)
+    ds   = DATASETS[dataset_id]
+    mask = _filter_mask(dataset_id, filters_key)
 
     if query:
-        qvec = encode_text(query)
-        sims = EMBEDDINGS @ qvec
+        qvec = encode_text(query, ds.clip_key)
+        sims = ds.embeddings @ qvec
         if mask is not None:
-            sims = np.where(mask, sims, -np.inf)
-            order = np.argsort(-sims)
-            n_valid = int(mask.sum())
-            order = order[:n_valid]
-            sorted_scores = sims[order]
+            sims  = np.where(mask, sims, -np.inf)
+            order = np.argsort(-sims)[:int(mask.sum())]
         else:
             order = np.argsort(-sims)
-            sorted_scores = sims[order]
+        sorted_scores = sims[order]
     else:
-        if mask is None:
-            order = np.arange(len(PATHS))
-        else:
-            order = np.flatnonzero(mask)
+        order         = np.flatnonzero(mask) if mask is not None else np.arange(len(ds.paths))
         sorted_scores = np.zeros(len(order), dtype=np.float32)
 
     order = order.astype(np.int32)
-    dt = (time.time() - t0) * 1000
-    print(f"[rank] q={query!r} filters={len(filters_key)} -> {len(order)} results in {dt:.1f}ms")
+    print(f"[rank] {dataset_id} q={query!r} filters={len(filters_key)} -> {len(order)} in {(time.time()-t0)*1e3:.1f}ms")
     return order, sorted_scores
 
 
-def search_page(query: str, filters_key: tuple, offset: int, limit: int) -> tuple[list[dict], int]:
-    """Return a slice of ranked/filtered results plus the total count."""
-    order, sorted_scores = _rank(query, filters_key)
-    total = len(order)
+def search_page(dataset_id: str, query: str, filters_key: tuple, offset: int, limit: int) -> tuple[list[dict], int]:
+    ds = DATASETS[dataset_id]
+    order, scores = _rank(dataset_id, query, filters_key)
+    total  = len(order)
     offset = max(0, offset)
-    limit = max(0, min(limit, total - offset))
-    page_idx = order[offset : offset + limit]
-    page_scores = sorted_scores[offset : offset + limit]
-    results = [
-        {"path": PATHS[int(i)], "score": float(s), "rank": offset + k}
-        for k, (i, s) in enumerate(zip(page_idx, page_scores))
-    ]
-    return results, total
+    limit  = max(0, min(limit, total - offset))
+    page   = order[offset:offset + limit]
+    return (
+        [{"path": ds.paths[int(i)], "score": float(s), "rank": offset + k}
+         for k, (i, s) in enumerate(zip(page, scores[offset:offset + limit]))],
+        total,
+    )
 
 
 # ----------------------------------------------------------------------------
 # FastAPI app
 # ----------------------------------------------------------------------------
+
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title=f"{DATASET_LABEL} text-to-image search")
+app = FastAPI(title="text-to-image search")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
-app.mount(
-    "/thumbnails",
-    StaticFiles(directory=str(EMB_DIR / "thumbnails")),
-    name="thumbnails",
-)
+# Mount each dataset's thumbnail directory at /thumbnails/<dataset_id>/
+for _ds_id, _ds in DATASETS.items():
+    _thumb_dir = _ds.emb_dir / "thumbnails"
+    if _thumb_dir.is_dir():
+        app.mount(f"/thumbnails/{_ds_id}", StaticFiles(directory=str(_thumb_dir)), name=f"thumbs_{_ds_id}")
+        print(f"[startup] /thumbnails/{_ds_id} -> {_thumb_dir}")
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "n_embeddings": len(PATHS)}
+def _get_dataset(dataset_id: str) -> DatasetState:
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        raise HTTPException(404, f"unknown dataset '{dataset_id}'; available: {list(DATASETS)}")
+    return ds
 
 
-@app.get("/filters")
-def filters_endpoint():
-    return JSONResponse({
-        "fields": [
-            {"field": f["field"], "label": f["label"], "options": FILTER_OPTIONS[f["field"]]}
-            for f in FILTER_FIELDS
-        ],
-    })
-
-
-def _parse_filters(raw: list[str]) -> tuple:
-    """Parse ['nationality:Filipino', 'scene:12. Indoor: ...'] into a sorted tuple cache key."""
-    valid_fields = {f["field"] for f in FILTER_FIELDS}
+def _parse_filters(raw: list[str], ds: DatasetState) -> tuple:
+    valid = {f["field"] for f in ds.filter_fields}
     by_field: dict[str, set[str]] = {}
     for item in raw:
         if ":" not in item:
             continue
         field, value = item.split(":", 1)
-        if field not in valid_fields:
+        if field not in valid:
             continue
         by_field.setdefault(field, set()).add(value)
-    return tuple(sorted(
-        (field, tuple(sorted(values)))
-        for field, values in by_field.items()
-    ))
+    return tuple(sorted((f, tuple(sorted(vs))) for f, vs in by_field.items()))
+
+
+# --- endpoints ---------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"ok": True, "datasets": {ds_id: len(ds.paths) for ds_id, ds in DATASETS.items()}}
+
+
+@app.get("/datasets")
+def datasets_endpoint():
+    return JSONResponse({
+        "datasets": [
+            {"id": ds_id, "label": ds.label, "n_embeddings": len(ds.paths)}
+            for ds_id, ds in DATASETS.items()
+        ]
+    })
+
+
+@app.get("/filters")
+def filters_endpoint(dataset: str = DEFAULT_DATASET_ID):
+    ds = _get_dataset(dataset)
+    return JSONResponse({
+        "fields": [
+            {"field": f["field"], "label": f["label"], "options": ds.filter_options[f["field"]]}
+            for f in ds.filter_fields
+        ]
+    })
 
 
 @app.get("/search")
 @limiter.limit("60/minute")
 def search_endpoint(
     request: Request,
+    dataset: str = DEFAULT_DATASET_ID,
     q: str = "",
     offset: int = 0,
     limit: int = DEFAULT_K,
     filter: list[str] = Query(default_factory=list),
 ):
-    q = q.strip()
-    filters_key = _parse_filters(filter)
+    ds = _get_dataset(dataset)
+    q  = q.strip()
+    filters_key = _parse_filters(filter, ds)
     if not q and not filters_key:
         raise HTTPException(400, "provide a query, a filter, or both")
     if len(q) > 500:
@@ -315,32 +367,31 @@ def search_endpoint(
         raise HTTPException(400, f"limit must be in [1, {MAX_K}]")
     if offset < 0:
         raise HTTPException(400, "offset must be >= 0")
-    results, total = search_page(q, filters_key, offset, limit)
+
+    results, total = search_page(dataset, q, filters_key, offset, limit)
     for r in results:
         p = r["path"]
-        r["thumb_url"] = "/thumbnails/" + str(Path(p).with_suffix(".jpg"))
-        r["image_url"] = "/image?path=" + p
-        r["metadata"] = METADATA.get(p, {})
+        r["thumb_url"]  = f"/thumbnails/{dataset}/" + str(Path(p).with_suffix(".jpg"))
+        r["image_url"]  = f"/image?dataset={dataset}&path=" + p
+        r["metadata"]   = ds.metadata.get(p, {})
+
     return JSONResponse({
-        "query": q,
+        "query": q, "dataset": dataset,
         "filters": [{"field": f, "values": list(v)} for f, v in filters_key],
-        "offset": offset,
-        "limit": limit,
-        "total": total,
-        "results": results,
-        "has_more": offset + len(results) < total,
+        "offset": offset, "limit": limit, "total": total,
+        "results": results, "has_more": offset + len(results) < total,
     })
 
 
 @app.get("/image")
 @limiter.limit("60/minute")
-def full_image(request: Request, path: str):
-    """Serve the original image. Validates path is known (prevents LFI)."""
-    if path not in PATH_TO_IDX:
+def full_image(request: Request, dataset: str, path: str):
+    ds   = _get_dataset(dataset)
+    if path not in ds.path_to_idx:
         raise HTTPException(404, "unknown image")
-    full = (DATASET_ROOT / path).resolve()
+    full = (ds.dataset_root / path).resolve()
     try:
-        full.relative_to(DATASET_ROOT.resolve())
+        full.relative_to(ds.dataset_root.resolve())
     except ValueError:
         raise HTTPException(403, "path escape")
     if not full.is_file():
@@ -349,18 +400,22 @@ def full_image(request: Request, path: str):
 
 
 # ----------------------------------------------------------------------------
-# Minimal single-page UI
+# Single-page UI
 # ----------------------------------------------------------------------------
-_INDEX_HTML_TEMPLATE = r"""<!doctype html>
+
+INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__DATASET_LABEL__ search</title>
+<title>text-to-image search</title>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.3rem; margin-bottom: 1rem; }
+  h1 { font-size: 1.3rem; margin-bottom: .75rem; }
+  #dataset-tabs { display: flex; gap: .4rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .tab-btn { padding: .35rem .85rem; font-size: .9rem; border: 1px solid #888; background: transparent; color: inherit; border-radius: 4px; cursor: pointer; }
+  .tab-btn.active { background: #2563eb; color: #fff; border-color: #2563eb; }
   form { display: flex; gap: .5rem; margin-bottom: 1.5rem; }
   input[type=text] { flex: 1; padding: .6rem .8rem; font-size: 1rem; border: 1px solid #888; border-radius: 4px; }
   button { padding: .6rem 1rem; font-size: 1rem; cursor: pointer; }
@@ -391,7 +446,8 @@ _INDEX_HTML_TEMPLATE = r"""<!doctype html>
 </style>
 </head>
 <body>
-<h1>__DATASET_LABEL__ text-to-image search</h1>
+<h1>text-to-image search</h1>
+<div id="dataset-tabs"></div>
 <form id="f">
   <input id="q" type="text" placeholder="describe what you're looking for (or leave empty and use filters only)...">
   <button type="submit">Search</button>
@@ -399,7 +455,7 @@ _INDEX_HTML_TEMPLATE = r"""<!doctype html>
 <div id="filters"></div>
 <div id="status"></div>
 <div id="grid"></div>
-<div id="sentinel" style="height: 40px; margin: 1rem 0; text-align: center; color: #888; font-size: .85rem;"></div>
+<div id="sentinel" style="height:40px;margin:1rem 0;text-align:center;color:#888;font-size:.85rem;"></div>
 
 <div id="modal" onclick="if(event.target.id==='modal')closeModal()">
   <button id="close" onclick="closeModal()">×</button>
@@ -410,32 +466,65 @@ _INDEX_HTML_TEMPLATE = r"""<!doctype html>
 <script>
 const PAGE_SIZE = 30;
 
-const grid = document.getElementById('grid');
-const statusEl = document.getElementById('status');
-const sentinel = document.getElementById('sentinel');
-const modal = document.getElementById('modal');
-const modalImg = document.getElementById('modal-img');
-const metaDiv = document.getElementById('meta');
+const grid       = document.getElementById('grid');
+const statusEl   = document.getElementById('status');
+const sentinel   = document.getElementById('sentinel');
+const modal      = document.getElementById('modal');
+const modalImg   = document.getElementById('modal-img');
+const metaDiv    = document.getElementById('meta');
 const filtersBar = document.getElementById('filters');
+const tabsEl     = document.getElementById('dataset-tabs');
 
-const selected = new Map();
-let filterCatalog = [];
+let currentDataset = null;
+let filterCatalog  = [];
+const selected     = new Map();
 
-let state = {
-  query: '',
-  offset: 0,
-  total: 0,
-  hasMore: false,
-  loading: false,
-  searchT0: 0,
-};
+let state = { query:'', offset:0, total:0, hasMore:false, loading:false, searchT0:0 };
+
+// ---- dataset tabs ----------------------------------------------------------
+
+function renderDatasetTabs(datasets) {
+  if (datasets.length <= 1) { tabsEl.style.display = 'none'; return; }
+  tabsEl.innerHTML = '';
+  for (const ds of datasets) {
+    const btn = document.createElement('button');
+    btn.className = 'tab-btn';
+    btn.dataset.dataset = ds.id;
+    btn.textContent = ds.label;
+    btn.addEventListener('click', () => switchDataset(ds.id));
+    tabsEl.appendChild(btn);
+  }
+}
+
+async function switchDataset(dsId) {
+  currentDataset = dsId;
+  for (const btn of document.querySelectorAll('.tab-btn'))
+    btn.classList.toggle('active', btn.dataset.dataset === dsId);
+
+  // reset UI state
+  selected.clear();
+  grid.innerHTML = '';
+  statusEl.textContent = '';
+  sentinel.textContent = '';
+  state = { query:'', offset:0, total:0, hasMore:false, loading:false, searchT0:0 };
+  document.getElementById('q').value = '';
+
+  try {
+    const res  = await fetch(`/filters?dataset=${encodeURIComponent(dsId)}`);
+    const data = await res.json();
+    filterCatalog = data.fields;
+  } catch(e) { console.error('failed to load filters:', e); filterCatalog = []; }
+  renderFilterBar();
+  document.getElementById('q').focus();
+}
+
+// ---- filter bar ------------------------------------------------------------
 
 function buildFilterParams() {
-  const params = [];
-  for (const [field, values] of selected) {
-    for (const v of values) params.push(`filter=${encodeURIComponent(field + ':' + v)}`);
-  }
-  return params.join('&');
+  const parts = [];
+  for (const [field, vals] of selected)
+    for (const v of vals) parts.push(`filter=${encodeURIComponent(field+':'+v)}`);
+  return parts.join('&');
 }
 
 function renderFilterBar() {
@@ -443,38 +532,37 @@ function renderFilterBar() {
   for (const fdef of filterCatalog) {
     const wrap = document.createElement('div');
     wrap.style.position = 'relative';
-    const sel = selected.get(fdef.field);
+    const sel   = selected.get(fdef.field);
     const count = sel ? sel.size : 0;
-    const btn = document.createElement('button');
-    btn.type = 'button';
+    const btn   = document.createElement('button');
+    btn.type      = 'button';
     btn.className = 'filter-btn' + (count > 0 ? ' active' : '');
-    btn.innerHTML = `${fdef.label}${count > 0 ? `<span class="count">· ${count}</span>` : ''}`;
+    btn.innerHTML = fdef.label + (count > 0 ? `<span class="count">· ${count}</span>` : '');
     const pop = document.createElement('div');
     pop.className = 'filter-pop';
     for (const opt of fdef.options) {
       const lbl = document.createElement('label');
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
+      const cb  = document.createElement('input');
+      cb.type    = 'checkbox';
       cb.checked = !!(sel && sel.has(opt.value));
       cb.addEventListener('change', () => {
         if (!selected.has(fdef.field)) selected.set(fdef.field, new Set());
         const s = selected.get(fdef.field);
-        if (cb.checked) s.add(opt.value); else s.delete(opt.value);
+        cb.checked ? s.add(opt.value) : s.delete(opt.value);
         if (s.size === 0) selected.delete(fdef.field);
         triggerSearch();
         renderFilterBar();
       });
       lbl.appendChild(cb);
-      const swatch = renderSwatch(fdef.field, opt.value);
-      if (swatch) lbl.insertAdjacentHTML('beforeend', swatch);
+      const sw = renderSwatch(fdef.field, opt.value);
+      if (sw) lbl.insertAdjacentHTML('beforeend', sw);
       lbl.appendChild(document.createTextNode(' ' + opt.label));
       pop.appendChild(lbl);
     }
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', e => {
       e.stopPropagation();
-      for (const el of document.querySelectorAll('.filter-pop.open')) {
+      for (const el of document.querySelectorAll('.filter-pop.open'))
         if (el !== pop) el.classList.remove('open');
-      }
       pop.classList.toggle('open');
     });
     wrap.appendChild(btn);
@@ -483,30 +571,28 @@ function renderFilterBar() {
   }
   if (selected.size > 0) {
     const clear = document.createElement('button');
-    clear.id = 'clear-filters';
-    clear.type = 'button';
+    clear.id        = 'clear-filters';
+    clear.type      = 'button';
     clear.textContent = 'Clear filters';
-    clear.addEventListener('click', () => {
-      selected.clear();
-      renderFilterBar();
-      triggerSearch();
-    });
+    clear.addEventListener('click', () => { selected.clear(); renderFilterBar(); triggerSearch(); });
     filtersBar.appendChild(clear);
   }
 }
 
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('.filter-pop') && !e.target.closest('.filter-btn')) {
+document.addEventListener('click', e => {
+  if (!e.target.closest('.filter-pop') && !e.target.closest('.filter-btn'))
     for (const el of document.querySelectorAll('.filter-pop.open')) el.classList.remove('open');
-  }
 });
 
+// ---- search / pagination ---------------------------------------------------
+
 async function fetchPage() {
-  if (state.loading || !state.hasMore) return;
+  if (state.loading || !state.hasMore || !currentDataset) return;
   state.loading = true;
   sentinel.textContent = 'loading...';
   try {
     const qs = [
+      `dataset=${encodeURIComponent(currentDataset)}`,
       `q=${encodeURIComponent(state.query)}`,
       `offset=${state.offset}`,
       `limit=${PAGE_SIZE}`,
@@ -521,7 +607,7 @@ async function fetchPage() {
       return;
     }
     if (res.status === 429) { sentinel.textContent = 'rate limited, slow down'; state.loading = false; return; }
-    if (!res.ok) { sentinel.textContent = 'error: ' + res.status; state.loading = false; return; }
+    if (!res.ok)            { sentinel.textContent = 'error: ' + res.status;     state.loading = false; return; }
     const data = await res.json();
 
     for (const r of data.results) {
@@ -529,24 +615,24 @@ async function fetchPage() {
       card.className = 'card';
       const scoreLabel = state.query ? r.score.toFixed(3) : '';
       card.innerHTML = `<img loading="lazy" src="${r.thumb_url}" alt="">` +
-                      (scoreLabel ? `<span class="score">${scoreLabel}</span>` : '');
+                       (scoreLabel ? `<span class="score">${scoreLabel}</span>` : '');
       card.onclick = () => openModal(r);
       grid.appendChild(card);
     }
 
     state.offset += data.results.length;
-    state.total = data.total;
+    state.total   = data.total;
     state.hasMore = data.has_more;
 
     if (state.offset === data.results.length) {
-      const dt = (performance.now() - state.searchT0).toFixed(0);
+      const dt    = (performance.now() - state.searchT0).toFixed(0);
       const label = state.query ? 'matching results' : 'results';
       statusEl.textContent = `${data.total} ${label} (${dt}ms). scroll for more.`;
     } else {
       statusEl.textContent = `showing ${state.offset} of ${state.total}`;
     }
     sentinel.textContent = state.hasMore ? '' : `— end (${state.total} results) —`;
-  } catch (err) {
+  } catch(err) {
     sentinel.textContent = 'error: ' + err.message;
   } finally {
     state.loading = false;
@@ -557,70 +643,65 @@ function triggerSearch() {
   const q = document.getElementById('q').value.trim();
   if (!q && selected.size === 0) {
     grid.innerHTML = '';
-    state.hasMore = false;
+    state.hasMore  = false;
     statusEl.textContent = '';
     sentinel.textContent = '';
     return;
   }
-  state = { query: q, offset: 0, total: 0, hasMore: true, loading: false, searchT0: performance.now() };
-  grid.innerHTML = '';
+  state = { query:q, offset:0, total:0, hasMore:true, loading:false, searchT0:performance.now() };
+  grid.innerHTML       = '';
   statusEl.textContent = 'searching...';
   sentinel.textContent = '';
   fetchPage();
 }
 
-document.getElementById('f').addEventListener('submit', (e) => {
-  e.preventDefault();
-  triggerSearch();
-});
+document.getElementById('f').addEventListener('submit', e => { e.preventDefault(); triggerSearch(); });
 
-const io = new IntersectionObserver((entries) => {
-  for (const e of entries) if (e.isIntersecting) fetchPage();
-}, { rootMargin: '400px' });
+const io = new IntersectionObserver(
+  entries => { for (const e of entries) if (e.isIntersecting) fetchPage(); },
+  { rootMargin: '400px' }
+);
 io.observe(sentinel);
+
+// ---- modal -----------------------------------------------------------------
 
 function openModal(r) {
   modalImg.src = r.image_url;
   const rows = Object.entries(r.metadata)
-    .filter(([k, v]) => v !== '' && v != null)
+    .filter(([, v]) => v !== '' && v != null)
     .map(([k, v]) => {
-      const swatch = renderSwatch(k, String(v));
-      return `<tr><td>${k}</td><td>${swatch}${escapeHtml(String(v))}</td></tr>`;
-    })
-    .join('');
+      const sw = renderSwatch(k, String(v));
+      return `<tr><td>${k}</td><td>${sw}${escapeHtml(String(v))}</td></tr>`;
+    }).join('');
   metaDiv.innerHTML = `<table>${rows}</table>`;
   modal.classList.add('open');
 }
 function closeModal() { modal.classList.remove('open'); modalImg.src = ''; }
-function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
-
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+}
 function renderSwatch(field, value) {
   if (!/skin_color/.test(field)) return '';
   const m = /\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(value || '');
   if (!m) return '';
-  const [_, r, g, b] = m;
-  return `<span class="swatch" style="background: rgb(${r},${g},${b})"></span>`;
+  return `<span class="swatch" style="background:rgb(${m[1]},${m[2]},${m[3]})"></span>`;
 }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+// ---- bootstrap -------------------------------------------------------------
 
 (async () => {
   try {
-    const res = await fetch('/filters');
+    const res  = await fetch('/datasets');
     const data = await res.json();
-    filterCatalog = data.fields;
-    renderFilterBar();
-  } catch (err) {
-    console.error('failed to load filters:', err);
-  }
-  document.getElementById('q').focus();
+    renderDatasetTabs(data.datasets);
+    if (data.datasets.length > 0) await switchDataset(data.datasets[0].id);
+  } catch(e) { console.error('failed to load datasets:', e); }
 })();
 </script>
 </body>
 </html>
 """
-
-INDEX_HTML = _INDEX_HTML_TEMPLATE.replace("__DATASET_LABEL__", DATASET_LABEL)
 
 
 @app.get("/", response_class=HTMLResponse)
