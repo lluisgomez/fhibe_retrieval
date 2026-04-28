@@ -19,6 +19,7 @@ Usage:
 
 import csv
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -183,10 +184,15 @@ def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
         vals  = list({v for v in filter_values[field] if v})
 
         def _sort_key(v: str, _s=strip) -> tuple:
+            # PHIBE: "12. Indoor: ..." → sort by leading numeric prefix
             parts = v.split(". ", 1)
             if _s and len(parts) == 2 and parts[0].strip().isdigit():
-                return (0, int(parts[0]))
-            return (1, v)
+                return (0, int(parts[0]), "")
+            # Natural numeric: "Tone 1" < "Tone 2" < "Tone 10"; N/A last
+            m = re.search(r"(\d+)", v)
+            if m:
+                return (1, int(m.group(1)), v)
+            return (2, 0, v)
 
         vals.sort(key=_sort_key)
         filter_options[field] = [{"value": v, "label": _clean_label(v, strip)} for v in vals]
