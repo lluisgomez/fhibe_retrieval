@@ -159,6 +159,20 @@ def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
             if fdef.get("derived_type") == "age_bucket":
                 src = fdef.get("derived_from", "age")
                 filter_values[field][i] = _age_to_bucket(row.get(src, ""), age_buckets)
+            elif fdef.get("derived_type") == "max_vote":
+                # Pick the label whose annotator vote count is highest.
+                # derived_prefix + suffix (str key) = column name; value is vote count.
+                prefix    = fdef.get("derived_prefix", "")
+                cols_map  = fdef.get("derived_columns", {})
+                best_label, best_val = "", -1
+                for suffix, label in cols_map.items():
+                    try:
+                        val = int(float(row.get(prefix + str(suffix), 0) or 0))
+                    except (ValueError, TypeError):
+                        val = 0
+                    if val > best_val:
+                        best_val, best_label = val, label
+                filter_values[field][i] = best_label if best_val > 0 else ""
             else:
                 filter_values[field][i] = row.get(field, "") or ""
 

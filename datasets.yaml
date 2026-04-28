@@ -1,4 +1,56 @@
 datasets:
+  facet:
+    label: "FACET"
+    clip_model: "ViT-B-32"
+    clip_pretrained: "openai"
+    dataset_root: "/data/datasets/FACET"
+    emb_dir:      "/data/datasets/FACET/facet_embeddings"
+    csv:          "annotations/facet_single_person.csv"
+    csv_path_template: "images/{filename}"
+    strip_numeric_prefix: false
+    metadata_columns:
+      - person_id
+      - filename
+      - class1
+      - class2
+    filter_fields:
+      - field: class1
+        label: "Category"
+      - field: gender_presentation
+        label: "Gender presentation"
+        derived_type: max_vote
+        derived_prefix: "gender_presentation_"
+        derived_columns:
+          masc: "Masculine"
+          fem: "Feminine"
+          non_binary: "Non-binary"
+          na: "N/A"
+      - field: age_presentation
+        label: "Age presentation"
+        derived_type: max_vote
+        derived_prefix: "age_presentation_"
+        derived_columns:
+          young: "Young"
+          middle: "Middle"
+          older: "Older"
+          na: "N/A"
+      - field: skin_tone
+        label: "Skin tone"
+        derived_type: max_vote
+        derived_prefix: "skin_tone_"
+        derived_columns:
+          "1": "Tone 1"
+          "2": "Tone 2"
+          "3": "Tone 3"
+          "4": "Tone 4"
+          "5": "Tone 5"
+          "6": "Tone 6"
+          "7": "Tone 7"
+          "8": "Tone 8"
+          "9": "Tone 9"
+          "10": "Tone 10"
+          na: "N/A"
+
   miap:
     label: "MIAP"
     clip_model: "ViT-B-32"
