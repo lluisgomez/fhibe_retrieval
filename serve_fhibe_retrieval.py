@@ -123,6 +123,7 @@ def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
     clip_key       = (clip_model, clip_pretrained)
     strip          = cfg.get("strip_numeric_prefix", False)
     csv_path_col   = cfg.get("csv_path_col", "filepath")
+    path_template  = cfg.get("csv_path_template")   # e.g. "images/{ImageID}.jpg"
     filter_fields  = cfg["filter_fields"]
     meta_columns   = cfg["metadata_columns"]
     age_buckets    = [tuple(b) for b in cfg.get("age_buckets", [])]
@@ -147,7 +148,7 @@ def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
     csv_rows: dict[str, dict] = {}
     with open(csv_path, newline="") as fh:
         for row in csv.DictReader(fh):
-            fp = row[csv_path_col]
+            fp = path_template.format(**row) if path_template else row[csv_path_col]
             metadata[fp] = {k: row.get(k, "") for k in meta_columns}
             csv_rows[fp] = row
 

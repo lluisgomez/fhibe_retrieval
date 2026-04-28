@@ -1,4 +1,37 @@
 datasets:
+  miap:
+    label: "MIAP"
+    clip_model: "ViT-B-32"
+    clip_pretrained: "openai"
+    emb_dir_env: "MIAP_EMB_DIR"
+    emb_dir_default: "./miap_embeddings"
+    dataset_root_env: "MIAP_DATASET_ROOT"
+    dataset_root_default: "/data/datasets/MIAP"
+    csv_env: "MIAP_CSV"
+    csv_relative_default: "metadata/filtered_miap.csv"
+    # Images live at images/<ImageID>.jpg — no dedicated filepath column in CSV
+    csv_path_template: "images/{ImageID}.jpg"
+    # All rows in filtered_miap.csv are relevant; no primary-image filter needed
+    strip_numeric_prefix: false
+    metadata_columns:
+      - ImageID
+      - GenderPresentation
+      - AgePresentation
+      - split
+      - IsOccluded
+      - IsTruncated
+      - IsGroupOf
+      - IsDepictionOf
+      - bbox_area
+      - centrality
+    filter_fields:
+      - field: GenderPresentation
+        label: "Gender presentation"
+      - field: AgePresentation
+        label: "Age presentation"
+      - field: split
+        label: "Split"
+
   phibe:
     label: "PHIBE"
     clip_model: "ViT-B-32"

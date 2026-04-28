@@ -92,11 +92,14 @@ def _resolve_paths(cfg: dict, args) -> tuple[Path, Path, Path]:
 def load_manifest(
     csv_path: Path,
     path_col: str,
+    path_template: str | None,
     primary_filter: dict | None,
     all_rows: bool,
 ) -> list[str]:
     """Return relative image paths from the manifest CSV.
 
+    Path is built from path_template (a str.format pattern over row columns,
+    e.g. "images/{ImageID}.jpg") when set, otherwise from path_col directly.
     If primary_filter is set and all_rows is False, only rows matching
     primary_filter['column'] == primary_filter['value'] are included.
     """
@@ -107,7 +110,7 @@ def load_manifest(
                 col, val = primary_filter["column"], primary_filter["value"]
                 if row.get(col, "").lower() != val.lower():
                     continue
-            paths.append(row[path_col])
+            paths.append(path_template.format(**row) if path_template else row[path_col])
     return paths
 
 
@@ -187,10 +190,11 @@ def main():
     cfg = _load_cfg(args.config, args.dataset)
     dataset_root, emb_dir, csv_path = _resolve_paths(cfg, args)
 
-    model_name  = args.model      or cfg.get("clip_model",      "ViT-B-32")
-    pretrained  = args.pretrained or cfg.get("clip_pretrained", "openai")
-    path_col    = cfg.get("csv_path_col", "filepath")
-    prim_filter = cfg.get("primary_filter")  # e.g. {"column": "is_primary", "value": "true"}
+    model_name    = args.model      or cfg.get("clip_model",      "ViT-B-32")
+    pretrained    = args.pretrained or cfg.get("clip_pretrained", "openai")
+    path_col      = cfg.get("csv_path_col", "filepath")
+    path_template = cfg.get("csv_path_template")   # e.g. "images/{ImageID}.jpg"
+    prim_filter   = cfg.get("primary_filter")       # e.g. {"column": "is_primary", "value": "true"}
 
     emb_dir.mkdir(parents=True, exist_ok=True)
     thumb_dir = emb_dir / "thumbnails"
@@ -202,7 +206,7 @@ def main():
     print(f"[setup] out_dir={emb_dir}")
     print(f"[setup] reading manifest: {csv_path}")
 
-    rel_paths = load_manifest(csv_path, path_col, prim_filter, args.all_rows)
+    rel_paths = load_manifest(csv_path, path_col, path_template, prim_filter, args.all_rows)
     print(f"[setup] manifest rows: {len(rel_paths)}")
 
     # Resume: skip already-embedded paths
