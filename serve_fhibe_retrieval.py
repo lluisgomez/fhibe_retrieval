@@ -177,6 +177,16 @@ def _load_dataset(ds_id: str, cfg: dict) -> DatasetState:
             else:
                 filter_values[field][i] = row.get(field, "") or ""
 
+    # Inject derived filter values (max_vote, age_bucket) into metadata for modal display
+    for fdef in filter_fields:
+        if not fdef.get("derived_type"):
+            continue
+        field = fdef["field"]
+        for i, p in enumerate(paths):
+            val = filter_values[field][i]
+            if val and p in metadata:
+                metadata[p][field] = val
+
     # --- filter options (sorted display list per field) ---
     filter_options: dict[str, list[dict]] = {}
     for fdef in filter_fields:
