@@ -357,12 +357,13 @@ def datasets_endpoint():
 @app.get("/filters")
 def filters_endpoint(dataset: str = DEFAULT_DATASET_ID):
     ds = _get_dataset(dataset)
-    return JSONResponse({
-        "fields": [
-            {"field": f["field"], "label": f["label"], "options": ds.filter_options[f["field"]]}
-            for f in ds.filter_fields
-        ]
-    })
+    fields = []
+    for f in ds.filter_fields:
+        entry = {"field": f["field"], "label": f["label"], "options": ds.filter_options[f["field"]]}
+        if "swatch_colors" in f:
+            entry["swatch_colors"] = f["swatch_colors"]
+        fields.append(entry)
+    return JSONResponse({"fields": fields})
 
 
 @app.get("/search")
@@ -686,11 +687,13 @@ io.observe(sentinel);
 
 function openModal(r) {
   modalImg.src = r.image_url;
+  const labelMap = Object.fromEntries(filterCatalog.map(f => [f.field, f.label]));
+  const prettify = k => labelMap[k] || k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   const rows = Object.entries(r.metadata)
     .filter(([, v]) => v !== '' && v != null)
     .map(([k, v]) => {
       const sw = renderSwatch(k, String(v));
-      return `<tr><td>${k}</td><td>${sw}${escapeHtml(String(v))}</td></tr>`;
+      return `<tr><td>${prettify(k)}</td><td>${sw}${escapeHtml(String(v))}</td></tr>`;
     }).join('');
   metaDiv.innerHTML = `<table>${rows}</table>`;
   modal.classList.add('open');
@@ -700,10 +703,15 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 }
 function renderSwatch(field, value) {
-  if (!/skin_color/.test(field)) return '';
+  const fdef = filterCatalog.find(f => f.field === field);
+  if (fdef && fdef.swatch_colors) {
+    const color = fdef.swatch_colors[value];
+    if (color) return `<span class="swatch" style="background:${color}"></span>`;
+  }
+  // PHIBE apparent_skin_color stores [r,g,b] strings
   const m = /\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(value || '');
-  if (!m) return '';
-  return `<span class="swatch" style="background:rgb(${m[1]},${m[2]},${m[3]})"></span>`;
+  if (m) return `<span class="swatch" style="background:rgb(${m[1]},${m[2]},${m[3]})"></span>`;
+  return '';
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 

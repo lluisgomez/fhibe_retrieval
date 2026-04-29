@@ -50,6 +50,17 @@ datasets:
           "9": "Tone 9"
           "10": "Tone 10"
           na: "N/A"
+        swatch_colors:
+          "Tone 1":  "#f6ede4"
+          "Tone 2":  "#f3e7db"
+          "Tone 3":  "#f7ead0"
+          "Tone 4":  "#eadaba"
+          "Tone 5":  "#d7bd96"
+          "Tone 6":  "#a07850"
+          "Tone 7":  "#825c43"
+          "Tone 8":  "#604134"
+          "Tone 9":  "#3a312a"
+          "Tone 10": "#292420"
 
   miap:
     label: "MIAP"
