@@ -441,7 +441,7 @@ INDEX_HTML = r"""<!doctype html>
 <title>text-to-image search</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+  body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 0 auto 2rem; padding: 0 1rem; }
   h1 { font-size: 1.3rem; margin-bottom: .75rem; }
   #dataset-tabs { display: flex; gap: .4rem; margin-bottom: 1rem; flex-wrap: wrap; }
   .tab-btn { padding: .35rem .85rem; font-size: .9rem; border: 1px solid #888; background: transparent; color: inherit; border-radius: 4px; cursor: pointer; }
@@ -473,16 +473,25 @@ INDEX_HTML = r"""<!doctype html>
   #meta td { padding: 2px 8px 2px 0; vertical-align: top; }
   #meta td:first-child { color: #999; white-space: nowrap; }
   #close { position: fixed; top: 1rem; right: 1.5rem; color: #fff; font-size: 2rem; cursor: pointer; background: none; border: none; }
+  #sticky-bar { position: fixed; top: 0; left: 0; right: 0; z-index: 10; background: Canvas; border-bottom: 1px solid rgba(128,128,128,.15); transition: transform .22s ease; }
+  #sticky-bar.hidden { transform: translateY(-100%); }
+  #sticky-bar-inner { max-width: 1200px; margin: 0 auto; padding: .75rem 1rem .5rem; }
+  #sticky-bar-inner h1 { margin-top: 0; margin-bottom: .5rem; }
 </style>
 </head>
 <body>
-<h1>text-to-image search</h1>
-<div id="dataset-tabs"></div>
-<form id="f">
-  <input id="q" type="text" placeholder="describe what you're looking for (or leave empty and use filters only)...">
-  <button type="submit">Search</button>
-</form>
-<div id="filters"></div>
+<div id="sticky-bar">
+  <div id="sticky-bar-inner">
+    <h1>text-to-image search</h1>
+    <div id="dataset-tabs"></div>
+    <form id="f">
+      <input id="q" type="text" placeholder="describe what you're looking for (or leave empty and use filters only)...">
+      <button type="submit">Search</button>
+    </form>
+    <div id="filters"></div>
+  </div>
+</div>
+<div id="sticky-spacer"></div>
 <div id="status"></div>
 <div id="grid"></div>
 <div id="sentinel" style="height:40px;margin:1rem 0;text-align:center;color:#888;font-size:.85rem;"></div>
@@ -724,6 +733,21 @@ function renderSwatch(field, value) {
   return '';
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// sticky bar: hide on scroll-down, reveal on scroll-up
+{
+  const bar    = document.getElementById('sticky-bar');
+  const spacer = document.getElementById('sticky-spacer');
+  new ResizeObserver(() => { spacer.style.height = bar.offsetHeight + 'px'; }).observe(bar);
+  let lastY = window.scrollY;
+  window.addEventListener('scroll', () => {
+    const y = window.scrollY;
+    if (y < 10)              bar.classList.remove('hidden');
+    else if (y > lastY + 4)  bar.classList.add('hidden');
+    else if (y < lastY - 4)  bar.classList.remove('hidden');
+    lastY = y;
+  }, { passive: true });
+}
 
 // ---- bootstrap -------------------------------------------------------------
 
