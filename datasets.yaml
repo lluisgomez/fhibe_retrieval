@@ -92,8 +92,8 @@ datasets:
       - field: split
         label: "Split"
 
-  phibe:
-    label: "PHIBE"
+  fhibe:
+    label: "FHIBE"
     clip_model: "ViT-B-32"
     clip_pretrained: "openai"
     dataset_root: "/data/datasets/FHIBE/fhibe.20250716.u.gT5_rFTA_downsampled_public"
